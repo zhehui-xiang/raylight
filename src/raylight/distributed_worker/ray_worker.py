@@ -410,8 +410,10 @@ class RayWorker:
         os.environ["NCCL_DEBUG"] = "WARN"
         if accelerator.is_xpu():
             import raylight_worker_setup
+            from raylight.distributed_modules.xpu_ulysses import patch_yunchang_all_to_all
 
             raylight_worker_setup.apply_patches()
+            patch_yunchang_all_to_all()
         else:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
         # torch.cuda was already initialized above under Ray's assigned GPU visibility.

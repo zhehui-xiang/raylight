@@ -1,17 +1,27 @@
+import os
+
 import torch
 
 import comfy
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3FunControlBlockPatch
 from comfy.ldm.minimax.model import AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP, PackedLayout, mask_row_values, pack_audio, patchify_video, rope_rotation_table, time_shift_sigma, unpack_audio, unpatchify_video
-from xfuser.core.distributed import get_sequence_parallel_rank, get_sequence_parallel_world_size, get_sp_group
+from xfuser.core.distributed import get_ring_parallel_world_size, get_sequence_parallel_rank, get_sequence_parallel_world_size, get_sp_group
 
 import raylight.distributed_modules.attention as xfuser_attn
+from raylight import accelerator
+from raylight.distributed_modules import xpu_ulysses
+from raylight.distributed_modules.inner_attention import INNER_ATTENTION_KEY
 from ..utils import pad_to_world_size
 
 
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
+use_xpu_ulysses = (
+    accelerator.is_xpu()
+    and os.environ.get("RAYLIGHT_XPU_FAST_ULYSSES", "1") != "0"
+    and get_ring_parallel_world_size() == 1
+)
 
 
 def _split_packed_sequence(h, rope_freqs, mod_segments):
@@ -48,7 +58,9 @@ def _run_control_patch(patch, args, block_wrap, full_size):
 
 
 def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}):
-    if self.comfy_attention.function is not None:
+    # comfy_attention only exists in ComfyUI builds with checkpoint-selected attention
+    comfy_attention = getattr(self, "comfy_attention", None)
+    if comfy_attention is not None and comfy_attention.function is not None:
         raise ValueError("Checkpoint-selected MiniMax H3 attention is not supported by Raylight USP")
     s = x.shape[0]
     q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
@@ -70,6 +82,10 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}):
     else:
         q = self.q_norm(q.view(s, self.heads, self.head_dim))
         k = self.k_norm(k.view(s, self.heads, self.head_dim))
+    sp_group = get_sp_group()
+    if (use_xpu_ulysses and INNER_ATTENTION_KEY not in transformer_options
+            and self.heads % sp_group.ulysses_world_size == 0):
+        return self.out_proj(xpu_ulysses.attention(q, k, v, sp_group.ulysses_group))
     v = v.clone()
     q = q.transpose(0, 1).unsqueeze(0)
     k = k.transpose(0, 1).unsqueeze(0)

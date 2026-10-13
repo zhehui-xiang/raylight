@@ -5,11 +5,12 @@ import os
 import torch
 
 
-# oneCCL defaults for Ray workers, as in intel/llm-scaler-omni 0.1.0-b8.
-# Values exported in the ComfyUI process take precedence.
+# oneCCL defaults for Ray workers, from intel/llm-scaler-omni 0.1.0-b8.
+# Values exported in the ComfyUI process take precedence. b8 also set
+# CCL_SYCL_CCL_BARRIER=1; on Arc Pro B70 (torch 2.13+xpu) it intermittently
+# hangs the MiniMax H3 USP all-to-all/all-gather sequence and doubles its time.
 _XPU_CCL_ENV_DEFAULTS = {
     "CCL_SYCL_ALLTOALL_ARC_LL": "1",
-    "CCL_SYCL_CCL_BARRIER": "1",
 }
 
 
