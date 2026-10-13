@@ -13,6 +13,7 @@ import ray
 
 import comfy.patcher_extension as pe
 
+from raylight import accelerator
 from raylight.distributed_modules.pipefusion import (
     PipeFusionInjectRegistry,
     pipefusion_diffusion_model_wrapper,
@@ -395,9 +396,9 @@ class RayWorker:
 
         self.device_id = device_id
         self.parallel_dict = parallel_dict
-        self.device = torch.device(f"cuda:{self.device_id}")
+        self.device = accelerator.bind_worker_device(self.device_id)
         self.device_mesh = None
-        self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
+        self.compute_capability = accelerator.compute_capability()
         self.pipefusion_config = PipeFusionConfig.from_parallel_dict(self.parallel_dict)
         self.pipefusion_stage = None
         self.xfuser_parallel = None
@@ -407,7 +408,12 @@ class RayWorker:
 
         os.environ["XDIT_LOGGING_LEVEL"] = "WARN"
         os.environ["NCCL_DEBUG"] = "WARN"
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
+        if accelerator.is_xpu():
+            import raylight_worker_setup
+
+            raylight_worker_setup.apply_patches()
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
         # torch.cuda was already initialized above under Ray's assigned GPU visibility.
         _enable_worker_dynamic_vram(worker_cli_args)
         _apply_worker_late_comfy_cli_args(worker_cli_args)
@@ -428,7 +434,7 @@ class RayWorker:
         group_port = base_port + self.group_id
 
         dist.init_process_group(
-            "nccl",
+            accelerator.dist_backend(),
             rank=nccl_rank,
             world_size=nccl_world_size,
             timeout=timedelta(minutes=1),
@@ -436,7 +442,7 @@ class RayWorker:
         )
 
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
-            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(nccl_world_size,))
+            self.device_mesh = dist.device_mesh.init_device_mesh(accelerator.device_type(), mesh_shape=(nccl_world_size,))
 
         # Just experimenting, user can't trigger this
         elif not self.parallel_dict.get("pipefusion_enabled"):
@@ -531,7 +537,7 @@ class RayWorker:
             self.vae_model = None
             self._cached_vae_path = None
 
-        torch.cuda.empty_cache()
+        accelerator.empty_cache()
         gc.collect()
 
     def clear_sampling_vram(self):
@@ -564,12 +570,12 @@ class RayWorker:
                 print(f"[Rank {self.local_rank}] cached model cleanup failed in clear_sampling_vram: {e}")
 
         gc.collect()
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() or accelerator.is_xpu():
             try:
-                torch.cuda.synchronize()
+                accelerator.synchronize()
             except Exception:
                 pass
-            torch.cuda.empty_cache()
+            accelerator.empty_cache()
             try:
                 torch.cuda.ipc_collect()
             except Exception:
@@ -868,7 +874,7 @@ class RayWorker:
             del self.state_dict
             self.model = None
             self.state_dict = None
-            torch.cuda.synchronize()
+            accelerator.synchronize()
             gc.collect()
             model_management.soft_empty_cache()
 
@@ -879,7 +885,7 @@ class RayWorker:
                 self.is_cpu_offload,
                 model_options=fsdp_model_options,
             )
-            torch.cuda.synchronize()
+            accelerator.synchronize()
             model_management.soft_empty_cache()
             gc.collect()
 
@@ -924,7 +930,7 @@ class RayWorker:
                 try:
                     cached_base_model = getattr(self.cached_base_model, "model", self.cached_base_model)
                     _first_p = next(cached_base_model.parameters(), None)
-                    if _first_p is not None and _first_p.device.type == "cuda":
+                    if _first_p is not None and _first_p.device.type == accelerator.device_type():
                         _cached_has_gpu_weights = True
                 except Exception:
                     pass
@@ -1071,7 +1077,7 @@ class RayWorker:
             del self.vae_model
             self.vae_model = None
             self._cached_vae_path = None
-            torch.cuda.empty_cache()
+            accelerator.empty_cache()
 
         vae_model = load_vae_model(vae_path)
 
@@ -1136,7 +1142,7 @@ class RayWorker:
             self._patch_fsdp_for_sampling()
             del self.state_dict
             self.state_dict = None
-            torch.cuda.synchronize()
+            accelerator.synchronize()
             comfy_model_management.soft_empty_cache()
             gc.collect()
 
@@ -1233,7 +1239,7 @@ class RayWorker:
             self._patch_fsdp_for_sampling()
             del self.state_dict
             self.state_dict = None
-            torch.cuda.synchronize()
+            accelerator.synchronize()
             comfy_model_management.soft_empty_cache()
             gc.collect()
 
@@ -1286,7 +1292,7 @@ class RayWorker:
             if old_model is not None:
                 del old_model
             self.cached_controlnet = None
-            torch.cuda.empty_cache()
+            accelerator.empty_cache()
             gc.collect()
 
         import comfy.controlnet as comfy_cnet
@@ -1309,7 +1315,7 @@ class RayWorker:
             if old_model is not None:
                 del old_model
             self.cached_controlnet = None
-            torch.cuda.empty_cache()
+            accelerator.empty_cache()
             gc.collect()
             if self.local_rank == 0:
                 print(f"[Rank {self.local_rank}] ControlNet cache freed")
@@ -1320,7 +1326,7 @@ class RayWorker:
             del self.vae_model
             self.vae_model = None
             self._cached_vae_path = None
-            torch.cuda.empty_cache()
+            accelerator.empty_cache()
             gc.collect()
             if self.local_rank == 0:
                 print(f"[Rank {self.local_rank}] VAE cache freed")
@@ -1418,11 +1424,12 @@ class RayWorker:
 
 class RayCOMMTester:
     def __init__(self, local_rank, world_size, device_id):
-        device = torch.device(f"cuda:{device_id}")
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+        device = accelerator.bind_worker_device(device_id)
+        if not accelerator.is_xpu():
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
 
         dist.init_process_group(
-            "nccl",
+            accelerator.dist_backend(),
             rank=local_rank,
             world_size=world_size,
             timeout=timedelta(minutes=1),
@@ -1448,16 +1455,16 @@ class RayCOMMTester:
         ray.actor.exit_actor()
 
 
-def ray_nccl_tester(world_size):
+def ray_nccl_tester(world_size, parallel_dict=None):
     gpu_actor = ray.remote(RayCOMMTester)
     gpu_actors = []
 
     for local_rank in range(world_size):
         gpu_actors.append(
-            gpu_actor.options(num_gpus=1, name=f"RayTest:{local_rank}").remote(
+            gpu_actor.options(num_gpus=accelerator.actor_num_gpus(), name=f"RayTest:{local_rank}").remote(
                 local_rank=local_rank,
                 world_size=world_size,
-                device_id=0,
+                device_id=accelerator.actor_device_id(local_rank, parallel_dict or {}),
             )
         )
     for actor in gpu_actors:
@@ -1481,9 +1488,9 @@ def make_ray_actor_fn(world_size, parallel_dict):
             # XDiT DP stays in one global group; xFuser derives DP ranks internally.
             for local_rank in range(world_size):
                 gpu_actors.append(
-                    gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
+                    gpu_actor.options(num_gpus=accelerator.actor_num_gpus(), name=f"RayWorker:{local_rank}").remote(
                         local_rank=local_rank,
-                        device_id=0,
+                        device_id=accelerator.actor_device_id(local_rank, parallel_dict),
                         parallel_dict=parallel_dict,
                     )
                 )
@@ -1497,11 +1504,11 @@ def make_ray_actor_fn(world_size, parallel_dict):
                 for local_rank in range(shard_size):
                     gpu_actors.append(
                         gpu_actor.options(
-                            num_gpus=1,
+                            num_gpus=accelerator.actor_num_gpus(),
                             name=f"RayWorker:{group_id}_{local_rank}"
                         ).remote(
                             local_rank=local_rank,
-                            device_id=0,
+                            device_id=accelerator.actor_device_id(group_id * shard_size + local_rank, parallel_dict),
                             parallel_dict=group_parallel_dict,
                         )
                     )

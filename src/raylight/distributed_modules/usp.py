@@ -410,12 +410,12 @@ if hasattr(model_base, "MiniMaxH3"):
     @USPInjectRegistry.register(model_base.MiniMaxH3)
     def _inject_minimax_h3(model_patcher, base_model, *args):
         from ..comfy_dist.sd import FSDP_LORA_SIDECAR_ATTACHMENT
-        from ..diffusion_models.minimax.xdit_context_parallel import usp_attn_forward, usp_dit_forward, usp_mlp_forward
+        from ..diffusion_models.minimax.xdit_context_parallel import use_usp_attention, usp_dit_forward, usp_mlp_forward
 
         model = base_model.diffusion_model
         sidecar_groups = model_patcher.get_attachment(FSDP_LORA_SIDECAR_ATTACHMENT) or {}
         for i, block in enumerate(model.blocks):
-            block.attn.forward = types.MethodType(usp_attn_forward, block.attn)
+            use_usp_attention(block.attn)
             if f"diffusion_model.blocks.{i}.mlp.fc2" in sidecar_groups:
                 block.mlp.forward = types.MethodType(usp_mlp_forward, block.mlp)
         for i, block in enumerate(model.token_refiner.blocks):

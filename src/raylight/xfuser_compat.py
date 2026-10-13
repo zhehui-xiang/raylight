@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import logging
 import os
@@ -110,7 +111,13 @@ def _install_envs_stub() -> None:
         except ModuleNotFoundError:
             return False
 
+    def _is_xpu() -> bool:
+        return not torch.cuda.is_available() and hasattr(torch, "xpu") and torch.xpu.is_available()
+
     def get_device(local_rank: int) -> torch.device:
+        if _is_xpu():
+            # Raylight pins each XPU worker to a card; xFuser's local rank is not the card index.
+            return torch.device("xpu", torch.xpu.current_device())
         if _is_cuda() or _is_hip():
             return torch.device("cuda", local_rank)
         if _is_musa():
@@ -125,6 +132,8 @@ def _install_envs_stub() -> None:
         return get_device(0).type
 
     def get_torch_distributed_backend() -> str:
+        if _is_xpu():
+            return "xccl"
         if _is_cuda() or _is_hip():
             return "nccl"
         if _is_musa():
@@ -151,6 +160,7 @@ def _install_envs_stub() -> None:
     module._is_musa = _is_musa
     module._is_mps = _is_mps
     module._is_npu = _is_npu
+    module._is_xpu = _is_xpu
     module.get_device = get_device
     module.get_device_name = get_device_name
     module.get_torch_distributed_backend = get_torch_distributed_backend
@@ -260,6 +270,17 @@ def _install_distributed_modules(xfuser_root: Path) -> None:
     distributed_pkg.runtime_state = sys.modules["xfuser.core.distributed.runtime_state"]
 
 
+@contextlib.contextmanager
+def _report_cuda_available():
+    # xFuser gates its yunchang imports on torch.cuda.is_available(), which is False on XPU.
+    original = torch.cuda.is_available
+    torch.cuda.is_available = lambda: True
+    try:
+        yield
+    finally:
+        torch.cuda.is_available = original
+
+
 def _install_long_ctx_attention(xfuser_root: Path) -> None:
     long_ctx_root = xfuser_root / "core" / "long_ctx_attention"
     hybrid_root = long_ctx_root / "hybrid"
@@ -269,10 +290,11 @@ def _install_long_ctx_attention(xfuser_root: Path) -> None:
     _ensure_package("xfuser.core.long_ctx_attention.ring", ring_root)
     _install_cache_manager_stub()
 
-    attn_layer = _load_module(
-        "xfuser.core.long_ctx_attention.hybrid.attn_layer",
-        hybrid_root / "attn_layer.py",
-    )
+    with _report_cuda_available():
+        attn_layer = _load_module(
+            "xfuser.core.long_ctx_attention.hybrid.attn_layer",
+            hybrid_root / "attn_layer.py",
+        )
 
     try:
         from yunchang.kernels import AttnType as _RealAttnType

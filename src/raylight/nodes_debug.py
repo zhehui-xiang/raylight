@@ -7,6 +7,7 @@ import torch
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
+from . import accelerator
 from .distributed_worker.ray_worker import make_ray_actor_fn, ensure_fresh_actors, ray_nccl_tester
 
 
@@ -72,7 +73,7 @@ class RayInitializerDebug:
         self.parallel_dict = dict()
 
         world_size = GPU
-        max_world_size = torch.cuda.device_count()
+        max_world_size = accelerator.device_count()
         if world_size > max_world_size:
             raise ValueError("Too many gpus")
         if world_size == 0:

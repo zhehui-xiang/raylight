@@ -78,6 +78,24 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}):
     return self.out_proj(out.squeeze(0))
 
 
+_USP_ATTENTION_CLASSES = {}
+
+
+def use_usp_attention(attn):
+    # Override forward on the class, not the instance: fused DiTBlock routes
+    # (ComfyUI-OmniXPU) inspect type(block.attn).forward and would otherwise
+    # bypass USP and attend over the local shard only. Subclassing the current
+    # class keeps an FSDP2 wrapper class intact.
+    cls = type(attn)
+    if cls.forward is usp_attn_forward:
+        return
+    usp_cls = _USP_ATTENTION_CLASSES.get(cls)
+    if usp_cls is None:
+        usp_cls = type(f"USP{cls.__name__}", (cls,), {"forward": usp_attn_forward, "__module__": __name__})
+        _USP_ATTENTION_CLASSES[cls] = usp_cls
+    attn.__class__ = usp_cls
+
+
 def usp_mlp_forward(self, x):
     gate, up = self.fc1(x).chunk(2, dim=-1)
     return self.fc2(torch.nn.functional.silu(gate).mul_(up))

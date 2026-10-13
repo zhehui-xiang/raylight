@@ -15,6 +15,8 @@ import folder_paths
 from comfy.cli_args import args as comfy_args
 from yunchang.kernels import AttnType
 
+from . import accelerator
+
 # For naming style with comfyui equivalent nodes use "[Name of Nodes] (Ray)"
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils  # type: ignore
@@ -229,6 +231,14 @@ def _build_remote_runtime_env(module_dir: Path, repo_root: Path):
         },
         "excludes": excludes,
     }
+
+
+def _add_xpu_worker_runtime_env(runtime_env: dict[str, Any]):
+    import raylight_worker_setup
+
+    runtime_env["py_modules"] = [*runtime_env["py_modules"], str(_resolve_module_dir(raylight_worker_setup))]
+    runtime_env["worker_process_setup_hook"] = "raylight_worker_setup.setup"
+    runtime_env.setdefault("env_vars", {}).update(accelerator.worker_env_vars())
 
 
 _RAYLIGHT_MODULE_PATH = _resolve_module_dir(raylight)
@@ -504,10 +514,10 @@ class RayInitializer:
         effective_ring_degree = ring_degree
 
         selected_gpus = _parse_gpu_select(GPU_SELECT)
+        visible_gpu_count = accelerator.device_count()
         if selected_gpus is None:
-            max_world_size = torch.cuda.device_count()
+            max_world_size = visible_gpu_count
         else:
-            visible_gpu_count = torch.cuda.device_count()
             invalid = [gpu_idx for gpu_idx in selected_gpus if gpu_idx >= visible_gpu_count]
             if invalid:
                 raise ValueError(f"GPU_SELECT contains GPU index outside visible range 0-{visible_gpu_count - 1}: {invalid}")
@@ -542,6 +552,7 @@ class RayInitializer:
         self.parallel_dict["pp_degree"] = 1
         self.parallel_dict["dp_degree"] = dp_degree if dp_degree >= 1 else 1
         self.parallel_dict["clear_vram_after_sampling"] = clear_vram_after_sampling
+        self.parallel_dict["device_ids"] = list(selected_gpus) if selected_gpus is not None else list(range(world_size))
         _reset_pipefusion_runtime_config(self.parallel_dict)
 
         if ulysses_degree > 0 or ring_degree > 0 or cfg_degree > 0:
@@ -590,7 +601,10 @@ class RayInitializer:
         if ray_cluster_address not in _LOCAL_CLUSTER_ADDRESSES:
             runtime_env_base = deepcopy(_RAY_RUNTIME_ENV_REMOTE)
 
-        if selected_gpus is not None:
+        if accelerator.is_xpu():
+            # XPU workers keep every card visible and pin parallel_dict["device_ids"].
+            _add_xpu_worker_runtime_env(runtime_env_base)
+        elif selected_gpus is not None:
             # Adapted from avtc's Ray GPU visibility restriction idea.
             runtime_env_base.setdefault("env_vars", {})["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_idx) for gpu_idx in selected_gpus)
 
@@ -641,7 +655,7 @@ class RayInitializer:
 
         if not skip_comm_test:
             print("Running NCCL communication test...")
-            ray_nccl_tester(world_size)
+            ray_nccl_tester(world_size, self.parallel_dict)
         else:
             print("Skipping NCCL test (skip_comm_test=True)")
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
