@@ -14,6 +14,7 @@ import ray
 import comfy.patcher_extension as pe
 
 from raylight import accelerator
+from raylight.distributed_worker import h3_forward_timing
 from raylight.distributed_modules.pipefusion import (
     PipeFusionInjectRegistry,
     pipefusion_diffusion_model_wrapper,
@@ -417,6 +418,7 @@ class RayWorker:
         else:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
         # torch.cuda was already initialized above under Ray's assigned GPU visibility.
+        h3_forward_timing.install(self.local_rank)
         _enable_worker_dynamic_vram(worker_cli_args)
         _apply_worker_late_comfy_cli_args(worker_cli_args)
 

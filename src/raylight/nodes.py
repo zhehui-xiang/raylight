@@ -26,6 +26,7 @@ from .distributed_worker.ray_worker import (
     ensure_fresh_actors,
     ray_nccl_tester,
 )
+from .distributed_worker import h3_forward_timing
 from .distributed_worker.ray_worker_vae import combine_dist_vae_partials, combine_seedvr2_vae_partials
 
 
@@ -182,7 +183,11 @@ def _worker_cli_args_env_json() -> str:
 
 
 def _inject_worker_cli_args(runtime_env: dict[str, Any]):
-    runtime_env.setdefault("env_vars", {})["RAYLIGHT_COMFY_CLI_ARGS_JSON"] = _worker_cli_args_env_json()
+    env_vars = runtime_env.setdefault("env_vars", {})
+    env_vars["RAYLIGHT_COMFY_CLI_ARGS_JSON"] = _worker_cli_args_env_json()
+    timing = os.environ.get(h3_forward_timing.ENV_NAME)
+    if timing is not None:
+        env_vars[h3_forward_timing.ENV_NAME] = timing
 
 
 def _parse_gpu_select(gpu_select: str | None) -> tuple[int, ...] | None:
