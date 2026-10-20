@@ -291,7 +291,10 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
 
     # ===================== SP GATHER ===================== #
-    h = get_sp_group().all_gather(h.contiguous(), dim=0)
+    if use_xpu_ulysses:
+        h = xpu_ulysses.all_gather(h, get_sp_group().device_group)
+    else:
+        h = get_sp_group().all_gather(h.contiguous(), dim=0)
     h = h[:h_orig_size]
 
     va, vb, _ = next(s for s in layout.segments if s[2] == "video")

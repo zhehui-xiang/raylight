@@ -58,6 +58,20 @@ def patch_yunchang_all_to_all():
     yunchang_all_to_all.dist = proxy
 
 
+# oneCCL caches an IPC mapping for every buffer it exchanges and keeps it after
+# PyTorch frees the memory, so empty_cache leaks device memory unless collectives
+# keep reusing the same buffers.
+_buffers = {}
+
+
+def _buffer(name, shape, like):
+    buffer = _buffers.get(name)
+    if buffer is None or buffer.shape != shape or buffer.dtype != like.dtype or buffer.device != like.device:
+        buffer = torch.empty(shape, dtype=like.dtype, device=like.device)
+        _buffers[name] = buffer
+    return buffer
+
+
 def _local_attention(q, k, v):
     # q/k/v: (1, heads, S, d) backed by dense (1, S, heads, d) storage.
     if _cute is not None and q.dtype == torch.bfloat16 and q.shape[-1] == 128:
@@ -74,15 +88,26 @@ def attention(q, k, v, group):
     world = dist.get_world_size(group)
     s, heads, head_dim = q.shape
     heads_local = heads // world
+    shape = (world, s, heads_local, head_dim)
+    send = _buffer("send", shape, q)
     gathered = []
-    for t in (q, k, v):
-        send = t.unflatten(1, (world, heads_local)).transpose(0, 1).contiguous()  # (N, s, h/N, d)
-        recv = torch.empty_like(send)
+    for name, t in (("q", q), ("k", k), ("v", v)):
+        send.copy_(t.unflatten(1, (world, heads_local)).transpose(0, 1))  # (N, s, h/N, d)
+        recv = _buffer(name, shape, q)
         all_to_all_single(recv, send, group)
         # Received chunks concatenate to (S, h/N, d): BLHD storage, consumed without a copy.
         gathered.append(recv.view(1, world * s, heads_local, head_dim).transpose(1, 2))
-    out = _local_attention(*gathered).transpose(1, 2).contiguous()  # (1, S, h/N, d), no-op for CUTE
-    send = out.view(world, s, heads_local, head_dim)
-    recv = torch.empty_like(send)
+    out = _local_attention(*gathered)
+    send.view(1, world * s, heads_local, head_dim).copy_(out.transpose(1, 2))
+    recv = _buffers["q"]  # q is consumed; reuse its buffer for the output exchange
     all_to_all_single(recv, send, group)
-    return recv.transpose(0, 1).reshape(s, heads * head_dim)
+    return recv.transpose(0, 1).reshape(s, heads * head_dim)  # copies out of the reused buffer
+
+
+def all_gather(x, group):
+    """All-gather along dim 0 into a reused buffer, valid until the next call."""
+    send = _buffer("gather_send", x.shape, x)
+    send.copy_(x)
+    recv = _buffer("gather_recv", (dist.get_world_size(group) * x.shape[0], *x.shape[1:]), x)
+    dist.all_gather_into_tensor(recv, send, group=group)
+    return recv
