@@ -1,4 +1,5 @@
 import os
+import sys
 
 import torch
 
@@ -11,7 +12,7 @@ import raylight.distributed_modules.attention as xfuser_attn
 from raylight import accelerator
 from raylight.distributed_modules import xpu_ulysses
 from raylight.distributed_modules.inner_attention import INNER_ATTENTION_KEY
-from ..utils import pad_to_world_size
+from ..utils import pad_to_size
 
 
 attn_type = xfuser_attn.get_attn_type()
@@ -22,6 +23,79 @@ use_xpu_ulysses = (
     and os.environ.get("RAYLIGHT_XPU_FAST_ULYSSES", "1") != "0"
     and get_ring_parallel_world_size() == 1
 )
+
+
+# INT8 QK^T attention from ComfyUI-OmniXPU's h3i8attn sidecar, run inside USP: rms_rope + quantize on the
+# local shard, exchange int8 Q/K and scales, then fmha over the full sequence. RAYLIGHT_H3_INT8_ATTN=0 disables.
+_INT8_ATTN_KV_TILE = 32  # k_scale granularity of h3i8attn.rms_rope_quant
+_int8_attn_enabled = os.environ.get("RAYLIGHT_H3_INT8_ATTN", "1") != "0"
+_int8_attn_check_left = int(os.environ.get("RAYLIGHT_H3_INT8_ATTN_CHECK", "0"))
+_int8_attn_sidecar = None  # (ops, bf16_blocks) or False once looked up
+usp_int8_attention_calls = 0
+
+
+def _h3_int8_attention_sidecar():
+    """OmniXPU owns the INT8 attention sidecar and its bf16 block list (OMNIXPU_H3_INT8_ATTN*); reuse both."""
+    global _int8_attn_sidecar
+    if _int8_attn_sidecar is None:
+        _int8_attn_sidecar = False
+        for name, module in list(sys.modules.items()):
+            if name.endswith("adapters.h3_rms_modulation") and getattr(module, "_int8_attn_ops", None) is not None:
+                _int8_attn_sidecar = (module._int8_attn_ops, module._int8_attn_bf16_blocks)
+                break
+    return _int8_attn_sidecar or None
+
+
+def _int8_attention_active():
+    return _int8_attn_enabled and use_xpu_ulysses and _h3_int8_attention_sidecar() is not None
+
+
+def _extend_last_segment(mod_segments, rows):
+    """Give padding rows the last segment's modulation row so the segments still cover every row.
+
+    Padding rows are dropped after the gather; covering them keeps OmniXPU's segment check passing on the last rank.
+    """
+    start, stop, row = mod_segments[-1]
+    if stop >= rows:
+        return mod_segments
+    if isinstance(row, torch.Tensor):
+        row = torch.cat([row, row[-1:].expand(rows - stop)])
+    return [*mod_segments[:-1], (start, rows, row)]
+
+
+def _usp_int8_attention(attn, q, k, v, rope_freqs, qw, kw, transformer_options, group):
+    """q/k: (1, s, heads, 128) views before rms_rope, v: (s, heads, 128). None keeps the bf16 route."""
+    global usp_int8_attention_calls, _int8_attn_check_left
+    sidecar = _h3_int8_attention_sidecar() if _int8_attn_enabled else None
+    block = transformer_options.get("block_index")
+    if (
+        sidecar is None
+        or comfy.model_management.in_training
+        or torch.compiler.is_compiling()
+        or block is None
+        or block in sidecar[1]
+        or rope_freqs.dtype != torch.bfloat16
+        or rope_freqs.shape[-3] != 48
+        or q.shape[1] % _INT8_ATTN_KV_TILE != 0
+    ):
+        return None
+    ops = sidecar[0]
+    q8, k8, q_scale, k_scale = ops.rms_rope_quant(q, k, rope_freqs, qw, kw, attn.q_norm.eps)
+    out = xpu_ulysses.int8_attention(ops, q8, k8, q_scale, k_scale, v, group)
+    if not torch.compiler.is_compiling():
+        usp_int8_attention_calls += 1
+    if _int8_attn_check_left > 0:
+        # q/k are untouched by rms_rope_quant: run the bf16 route on them and log the error.
+        _int8_attn_check_left -= 1
+        comfy.quant_ops.ck.rms_rope_split_half_(
+            q, k, rope_freqs, qw, kw, epsilon=attn.q_norm.eps, rot_dim=rope_freqs.shape[-3] * 2)
+        ref = xpu_ulysses.attention(q[0], k[0], v, group).float()
+        err = ((out.float() - ref).norm() / ref.norm()).item()
+        cos = torch.nn.functional.cosine_similarity(
+            out.float().view(-1, attn.head_dim), ref.view(-1, attn.head_dim), dim=-1).min().item()
+        print(f"[raylight] H3 USP int8 attention check rank={get_sequence_parallel_rank()} block={block} "
+              f"rel_err={err:.4f} min_cos={cos:.4f}", flush=True)
+    return out
 
 
 def _split_packed_sequence(h, rope_freqs, mod_segments):
@@ -65,11 +139,18 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}):
     s = x.shape[0]
     q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
     v = v.view(s, self.heads, self.head_dim)
+    sp_group = get_sp_group()
+    xpu_fast = (use_xpu_ulysses and INNER_ATTENTION_KEY not in transformer_options
+                and self.heads % sp_group.ulysses_world_size == 0)
     if rope_freqs is not None:
         q = q.view(1, s, self.heads, self.head_dim)
         k = k.view(1, s, self.heads, self.head_dim)
         qw = comfy.model_management.cast_to(self.q_norm.weight, device=x.device)
         kw = comfy.model_management.cast_to(self.k_norm.weight, device=x.device)
+        if xpu_fast:
+            out = _usp_int8_attention(self, q, k, v, rope_freqs, qw, kw, transformer_options, sp_group.ulysses_group)
+            if out is not None:
+                return self.out_proj(out)
         rot = rope_freqs.shape[-3] * 2
         if comfy.model_management.in_training:
             q, k = comfy.quant_ops.ck.rms_rope_split_half(
@@ -82,9 +163,7 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}):
     else:
         q = self.q_norm(q.view(s, self.heads, self.head_dim))
         k = self.k_norm(k.view(s, self.heads, self.head_dim))
-    sp_group = get_sp_group()
-    if (use_xpu_ulysses and INNER_ATTENTION_KEY not in transformer_options
-            and self.heads % sp_group.ulysses_world_size == 0):
+    if xpu_fast:
         return self.out_proj(xpu_ulysses.attention(q, k, v, sp_group.ulysses_group))
     v = v.clone()
     q = q.transpose(0, 1).unsqueeze(0)
@@ -261,8 +340,11 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     # rotation table computed once per forward, consumed by the kitchen split-half rope
     rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
     # ===================== SP SPLIT ====================== #
-    h, h_orig_size = pad_to_world_size(h, dim=0)
-    rope_freqs, _ = pad_to_world_size(rope_freqs, dim=1)
+    # INT8 attention needs every rank's shard to be whole KV tiles, so pad to N * 32 instead of N.
+    pad_multiple = get_sequence_parallel_world_size() * (_INT8_ATTN_KV_TILE if _int8_attention_active() else 1)
+    h, h_orig_size = pad_to_size(h, pad_multiple, dim=0)
+    rope_freqs, _ = pad_to_size(rope_freqs, pad_multiple, dim=1)
+    mod_segments = _extend_last_segment(mod_segments, h.shape[0])
     h, rope_freqs, mod_segments = _split_packed_sequence(h, rope_freqs, mod_segments)
 
     # blocks

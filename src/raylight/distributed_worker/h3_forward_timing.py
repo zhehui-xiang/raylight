@@ -27,10 +27,18 @@ def _synchronize(x):
 
 def _fusion_stats():
     # ComfyUI-OmniXPU H3 route counters (cumulative), loaded in XPU workers by raylight_worker_setup.
+    stats = None
     for name, module in list(sys.modules.items()):
         if name.endswith("adapters.h3_rms_modulation") and hasattr(module, "get_stats"):
-            return module.get_stats()
-    return None
+            stats = module.get_stats()
+            break
+    if stats is not None:
+        for name, module in list(sys.modules.items()):
+            if name.endswith("minimax.xdit_context_parallel") and hasattr(module, "usp_int8_attention_calls"):
+                # INT8 attention run by raylight's USP attention (OmniXPU's int8_attention only counts its fused block)
+                stats["usp_int8_attention"] = module.usp_int8_attention_calls
+                break
+    return stats
 
 
 def _delta(after, before):

@@ -79,29 +79,70 @@ def _local_attention(q, k, v):
     return torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
 
+def _scatter_heads(name, send_name, t, group):
+    """(s_local, heads, head_dim) sharded by sequence -> (1, heads/N, S, head_dim) sharded by head.
+
+    Received chunks concatenate to (S, h/N, d): BLHD storage, consumed without a copy.
+    """
+    world = dist.get_world_size(group)
+    s, heads, head_dim = t.shape
+    heads_local = heads // world
+    shape = (world, s, heads_local, head_dim)
+    send = _buffer(send_name, shape, t)
+    send.copy_(t.unflatten(1, (world, heads_local)).transpose(0, 1))  # (N, s, h/N, d)
+    recv = _buffer(name, shape, t)
+    all_to_all_single(recv, send, group)
+    return recv.view(1, world * s, heads_local, head_dim).transpose(1, 2)
+
+
+def _gather_heads(out, s, group):
+    """(1, heads/N, S, head_dim) attention output -> (s_local, heads * head_dim)."""
+    world = dist.get_world_size(group)
+    _, heads_local, _, head_dim = out.shape
+    shape = (world, s, heads_local, head_dim)
+    send = _buffer("send", shape, out)
+    send.view(1, world * s, heads_local, head_dim).copy_(out.transpose(1, 2))
+    recv = _buffer("q", shape, out)  # q is consumed; reuse its buffer for the output exchange
+    all_to_all_single(recv, send, group)
+    return recv.transpose(0, 1).reshape(s, world * heads_local * head_dim)  # copies out of the reused buffer
+
+
 def attention(q, k, v, group):
     """Full-sequence attention over a sequence-sharded batch-1 input.
 
     q/k/v: (s_local, heads, head_dim) per rank, sequence order by rank.
     Returns (s_local, heads * head_dim).
     """
+    gathered = [_scatter_heads(name, "send", t, group) for name, t in (("q", q), ("k", k), ("v", v))]
+    return _gather_heads(_local_attention(*gathered), q.shape[0], group)
+
+
+def _scatter_scale(name, scale, group):
+    """Per-head scales (heads, n_local) -> (heads/N, N * n_local), contiguous as fmha expects."""
     world = dist.get_world_size(group)
-    s, heads, head_dim = q.shape
-    heads_local = heads // world
-    shape = (world, s, heads_local, head_dim)
-    send = _buffer("send", shape, q)
-    gathered = []
-    for name, t in (("q", q), ("k", k), ("v", v)):
-        send.copy_(t.unflatten(1, (world, heads_local)).transpose(0, 1))  # (N, s, h/N, d)
-        recv = _buffer(name, shape, q)
-        all_to_all_single(recv, send, group)
-        # Received chunks concatenate to (S, h/N, d): BLHD storage, consumed without a copy.
-        gathered.append(recv.view(1, world * s, heads_local, head_dim).transpose(1, 2))
-    out = _local_attention(*gathered)
-    send.view(1, world * s, heads_local, head_dim).copy_(out.transpose(1, 2))
-    recv = _buffers["q"]  # q is consumed; reuse its buffer for the output exchange
+    heads, n = scale.shape
+    shape = (world, heads // world, n)
+    send = _buffer("send_" + name, shape, scale)
+    send.copy_(scale.view(shape))
+    recv = _buffer(name, shape, scale)
     all_to_all_single(recv, send, group)
-    return recv.transpose(0, 1).reshape(s, heads * head_dim)  # copies out of the reused buffer
+    return recv.transpose(0, 1).reshape(heads // world, world * n)  # rank order = sequence order
+
+
+def int8_attention(ops, q8, k8, q_scale, k_scale, v, group):
+    """Ulysses attention with INT8 QK^T: quantize on the local shard, exchange int8 Q/K and their scales.
+
+    ops is torch.ops.h3i8attn. q8/k8: (1, heads, s_local, 128) int8 BLHD from rms_rope_quant;
+    q_scale (heads, s_local) per token, k_scale (heads, s_local / 32) per KV tile, so s_local
+    must be a multiple of 32 for the local tiles to line up with the full-sequence tiles.
+    v: (s_local, heads, 128) bf16. Returns (s_local, heads * 128).
+    """
+    s = v.shape[0]
+    q8 = _scatter_heads("q8", "send_i8", q8.transpose(1, 2)[0], group)
+    k8 = _scatter_heads("k8", "send_i8", k8.transpose(1, 2)[0], group)
+    v = _scatter_heads("v", "send", v, group)
+    out = ops.fmha(q8, k8, v, _scatter_scale("q_scale", q_scale, group), _scatter_scale("k_scale", k_scale, group))
+    return _gather_heads(out, s, group)
 
 
 def all_gather(x, group):
